@@ -1,0 +1,152 @@
+from fastapi import APIRouter, Depends, UploadFile, File, Query
+from fastapi.responses import StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Annotated, List
+from app.core.database import get_db
+from app.services.kardex_service import KardexService
+from app.services.excel_service import ExcelService
+from app.schemas.kardex import KardexResponse, UploadResponse, FiltroKardex
+from app.schemas.procesamiento import ProcesamientoResumen
+from app.exceptions import ArchivoInvalidoException
+from app.core.config import settings
+from datetime import date
+import io
+
+
+router = APIRouter(prefix="/kardex", tags=["Kardex"])
+
+
+# ── Subir y procesar archivos ─────────────────────────────────────────────────
+@router.post("/procesar", response_model=UploadResponse, status_code=201)
+async def procesar_kardex(
+    movimiento1: Annotated[UploadFile,        File(description="Archivo de movimientos 1 (requerido)")],
+    movimiento2: Annotated[UploadFile | None, File(description="Archivo de movimientos 2 (opcional)")] = None,
+    movimiento3: Annotated[UploadFile | None, File(description="Archivo de movimientos 3 (opcional)")] = None,
+    saldos:      Annotated[UploadFile | None, File(description="Archivo de saldos iniciales (opcional)")] = None,
+    db:          AsyncSession = Depends(get_db),
+):
+    """
+    Sube y procesa archivos Excel de kardex.
+    Soporta hasta 3 archivos de movimientos simultáneos.
+    Calcula el saldo final, verifica integridad y persiste en BD.
+    """
+    # Armar lista de movimientos ignorando los None
+    movimientos = [f for f in [movimiento1, movimiento2, movimiento3] if f is not None]
+
+    # Validar extensiones
+    archivos_invalidos = [
+        f.filename for f in movimientos
+        if not f.filename.endswith(".xlsx")
+    ]
+    if archivos_invalidos:
+        raise ArchivoInvalidoException(
+            f"Los siguientes archivos no son .xlsx: {', '.join(archivos_invalidos)}"
+        )
+    if saldos and not saldos.filename.endswith(".xlsx"):
+        raise ArchivoInvalidoException("El archivo de saldos iniciales debe ser .xlsx")
+
+    # Leer bytes
+    saldo_bytes = await saldos.read() if saldos else None
+    archivos_mov = [
+        (f.filename, await f.read())
+        for f in movimientos
+    ]
+
+    # Validar tamaño de archivos
+    max_bytes = settings.MAX_FILE_SIZE_MB * 1024 * 1024
+    if saldo_bytes and len(saldo_bytes) > max_bytes:
+        raise ArchivoInvalidoException(
+            f"El archivo de saldos supera el tamaño máximo de {settings.MAX_FILE_SIZE_MB}MB"
+        )
+    for filename, file_bytes in archivos_mov:
+        if len(file_bytes) > max_bytes:
+            raise ArchivoInvalidoException(
+                f"'{filename}' supera el tamaño máximo de {settings.MAX_FILE_SIZE_MB}MB"
+            )
+
+    service = KardexService(db)
+    return await service.procesar_archivos(
+        saldo_bytes  = saldo_bytes,
+        archivos_mov = archivos_mov,
+    )
+
+
+# ── Consultar kardex con filtros ──────────────────────────────────────────────
+@router.get("/consultar/{procesamiento_id}", response_model=KardexResponse)
+async def consultar_kardex(
+    procesamiento_id: int,
+    codigo:           str | None  = Query(None, description="Código del producto"),
+    anio:             int | None  = Query(None, description="Año"),
+    mes:              int | None  = Query(None, description="Mes (1-12)"),
+    fecha_exacta:     str | None  = Query(None, description="Fecha exacta (YYYY-MM-DD)"),
+    fecha_desde:      str | None  = Query(None, description="Fecha inicio (YYYY-MM-DD)"),
+    fecha_hasta:      str | None  = Query(None, description="Fecha fin (YYYY-MM-DD)"),
+    db:               AsyncSession = Depends(get_db),
+):
+    """
+    Consulta el kardex procesado desde BD con filtros opcionales.
+    No reprocesa el archivo, usa los datos almacenados.
+    """
+    filtros = FiltroKardex(
+        codigo       = codigo,
+        anio         = anio,
+        mes          = mes,
+        fecha_exacta = fecha_exacta,
+        fecha_desde  = fecha_desde,
+        fecha_hasta  = fecha_hasta,
+    )
+
+    service = KardexService(db)
+    return await service.get_kardex(
+        procesamiento_id = procesamiento_id,
+        filtros          = filtros,
+    )
+
+
+# ── Historial de procesamientos ───────────────────────────────────────────────
+@router.get("/historial", response_model=list[ProcesamientoResumen])
+async def get_historial(
+    limit:  int = Query(20, ge=1, le=100),
+    offset: int = Query(0,  ge=0),
+    db:     AsyncSession = Depends(get_db),
+):
+    """
+    Retorna el historial de procesamientos paginado.
+    """
+    service = KardexService(db)
+    return await service.get_historial(limit=limit, offset=offset)
+
+
+# ── Exportar a Excel ──────────────────────────────────────────────────────────
+@router.get("/exportar/{procesamiento_id}")
+async def exportar_excel(
+    procesamiento_id: int,
+    codigo:      str | None  = Query(None, description="Filtrar por código"),
+    fecha_desde: str | None  = Query(None, description="Fecha inicio (YYYY-MM-DD)"),
+    fecha_hasta: str | None  = Query(None, description="Fecha fin (YYYY-MM-DD)"),
+    db:          AsyncSession = Depends(get_db),
+):
+    """
+    Genera y descarga el Excel del kardex procesado.
+    """
+    fecha_desde_parsed = date.fromisoformat(fecha_desde) if fecha_desde else None
+    fecha_hasta_parsed = date.fromisoformat(fecha_hasta) if fecha_hasta else None
+
+    service      = ExcelService(db)
+    excel_bytes  = await service.exportar(
+        procesamiento_id = procesamiento_id,
+        codigo           = codigo,
+        fecha_desde      = fecha_desde_parsed,
+        fecha_hasta      = fecha_hasta_parsed,
+    )
+
+    nombre_archivo = f"kardex_{procesamiento_id}"
+    if codigo:
+        nombre_archivo += f"_{codigo}"
+    nombre_archivo += ".xlsx"
+
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type   = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers      = {"Content-Disposition": f"attachment; filename={nombre_archivo}"}
+    )
